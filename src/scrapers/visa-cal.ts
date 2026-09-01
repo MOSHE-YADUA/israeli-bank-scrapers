@@ -432,6 +432,86 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
     return initData?.result.cards.map(({ cardUniqueId, last4Digits }) => ({ cardUniqueId, last4Digits }));
   }
 
+  /**
+   * Custom patch: some Cal logins are linked to more than one "bank identity"
+   * (a switcher in the top nav, e.g. "930 - ... לאומי כאל" vs "109 - ... דיסקונט לישראל").
+   * The default dashboard load only exposes the cards of whichever identity is
+   * selected first. This attempts to click the switcher and select the identity
+   * whose label contains SECOND_IDENTITY_KEYWORD, so that identity's cards are
+   * also picked up by getCards(). Safe no-op if the switcher isn't present
+   * (single-identity accounts).
+   */
+  private async trySwitchToSecondBankIdentity(): Promise<
+    { cardUniqueId: string; last4Digits: string }[]
+  > {
+    const SECOND_IDENTITY_KEYWORD = 'דיסקונט';
+    debug('checking for a multi-identity bank switcher on the dashboard');
+    try {
+      const initialCards = await this.getCards().catch(() => []);
+      debug('cards before identity-switch attempt: %O', initialCards.map(c => c.last4Digits));
+
+      const opened = await this.page.evaluate(() => {
+        function smallestMatch(pattern: RegExp): HTMLElement | null {
+          const all = Array.from(document.querySelectorAll('button, a, div, span, li')) as HTMLElement[];
+          const matches = all.filter(el => pattern.test(el.textContent || ''));
+          if (matches.length === 0) return null;
+          matches.sort((a, b) => a.querySelectorAll('*').length - b.querySelectorAll('*').length);
+          return matches[0];
+        }
+        // The switcher trigger looks like "930 - 10460886 לאומי כאל": digits - digits ... כאל
+        const trigger = smallestMatch(/\d+\s*-\s*\d+[^<>]*כאל/);
+        if (!trigger) return false;
+        trigger.click();
+        return true;
+      });
+
+      if (!opened) {
+        debug('no identity switcher found; assuming single-identity account, skipping');
+        return [];
+      }
+
+      // give the dropdown time to render
+      await new Promise(resolve => setTimeout(resolve, 1500));
+
+      const clicked = await this.page.evaluate((keyword: string) => {
+        function smallestMatch(text: string): HTMLElement | null {
+          const all = Array.from(document.querySelectorAll('button, a, div, span, li')) as HTMLElement[];
+          const matches = all.filter(el => (el.textContent || '').includes(text));
+          if (matches.length === 0) return null;
+          matches.sort((a, b) => a.querySelectorAll('*').length - b.querySelectorAll('*').length);
+          return matches[0];
+        }
+        const option = smallestMatch(keyword);
+        if (!option) return false;
+        option.click();
+        return true;
+      }, SECOND_IDENTITY_KEYWORD);
+
+      if (!clicked) {
+        debug('identity switcher opened but no option matched keyword "%s"', SECOND_IDENTITY_KEYWORD);
+        return [];
+      }
+
+      debug('clicked secondary identity option, waiting for cards list to refresh');
+      await waitUntil(
+        async () => {
+          const newCards = await this.getCards().catch(() => null);
+          if (!newCards) return false;
+          return JSON.stringify(newCards) !== JSON.stringify(initialCards);
+        },
+        'wait for cards list to change after identity switch',
+        15000,
+        1000,
+      );
+      const switchedCards = await this.getCards().catch(() => []);
+      debug('cards after identity-switch attempt: %O', switchedCards.map(c => c.last4Digits));
+      return switchedCards;
+    } catch (e) {
+      debug('identity-switch attempt failed, continuing with default identity only: %s', (e as Error).message);
+      return [];
+    }
+  }
+
   async getAuthorizationHeader() {
     if (!this.authorization) {
       debug('fetching authorization header');
@@ -627,11 +707,21 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
     const startMoment = moment.max(defaultStartMoment, moment(startDate));
     debug(`fetch transactions starting ${startMoment.format()}`);
 
-    const [cards, xSiteId, Authorization] = await Promise.all([
+    const [firstIdentityCards, xSiteId, Authorization] = await Promise.all([
       this.getCards(),
       this.getXSiteId(),
       this.getAuthorizationHeader(),
     ]);
+
+    const secondIdentityCards = await this.trySwitchToSecondBankIdentity();
+    const cardsById = new Map(
+      [...firstIdentityCards, ...secondIdentityCards].map(card => [card.cardUniqueId, card]),
+    );
+    const cards = Array.from(cardsById.values());
+    debug(
+      'total unique cards after checking for a second bank identity: %O',
+      cards.map(c => c.last4Digits),
+    );
 
     const futureMonthsToScrape = this.options.futureMonthsToScrape ?? 1;
 
